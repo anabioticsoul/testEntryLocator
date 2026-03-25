@@ -1,0 +1,17 @@
+file:/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig	credential.helper=osxkeychain
+file:/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig	init.defaultbranch=main
+file:/Users/liuyuhao/.gitconfig	filter.lfs.clean=git-lfs clean -- %f
+file:/Users/liuyuhao/.gitconfig	filter.lfs.smudge=git-lfs smudge -- %f
+file:/Users/liuyuhao/.gitconfig	filter.lfs.process=git-lfs filter-process
+file:/Users/liuyuhao/.gitconfig	filter.lfs.required=true
+file:.git/config	core.repositoryformatversion=0
+file:.git/config	core.filemode=true
+file:.git/config	core.bare=false
+file:.git/config	core.logallrefupdates=true
+file:.git/config	core.ignorecase=true
+file:.git/config	core.precomposeunicode=true
+file:.git/config	remote.origin.url=https://github.com/anabioticsoul/testEntryLocator.git
+file:.git/config	remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+file:.git/config	branch.main.remote=origin
+file:.git/config	branch.main.merge=refs/heads/main
+file:.git/config	branch.main.vscode-merge-base=origin/main

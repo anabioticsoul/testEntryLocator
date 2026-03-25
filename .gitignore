@@ -18,6 +18,10 @@ __pycache__/
 # Runtime outputs and downloaded datasets
 
 dataset/outputs/
+output/
+outputs/
+**/output/
+**/outputs/
 dataset/__pycache__/
 dataset/repos/
 
