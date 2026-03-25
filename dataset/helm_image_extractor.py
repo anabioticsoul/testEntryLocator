@@ -36,20 +36,42 @@ except Exception:
     print("Missing dependency: pyyaml. Install with: pip install pyyaml", file=sys.stderr)
     raise
 
+VERBOSE = False
+
+def log_debug(msg: str) -> None:
+    if VERBOSE:
+        print(f"[DEBUG] {msg}")
+
+def log_info(msg: str) -> None:
+    if VERBOSE:
+        print(f"[INFO] {msg}")
+
+def log_warn(msg: str) -> None:
+    if VERBOSE:
+        print(f"[WARN] {msg}")
+
 # ---------------------------
 # Utils: subprocess
 # ---------------------------
 
 def run(cmd: List[str], cwd: Optional[Path] = None, timeout: int = 900) -> Tuple[int, str, str]:
-    p = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
-    return p.returncode, p.stdout, p.stderr
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout if isinstance(e.stdout, str) else ""
+        stderr = e.stderr if isinstance(e.stderr, str) else ""
+        if stderr:
+            stderr = f"{stderr}\n"
+        stderr += f"command_timeout_after_{timeout}s: {' '.join(cmd)}"
+        return 124, stdout, stderr
 
 
 def must_have_tool(tool: str) -> None:
@@ -199,31 +221,111 @@ def find_chart_dirs(repo_dir: Path) -> List[Path]:
     return sorted(set(charts), key=lambda x: str(x))
 
 
-def helm_template(chart_dir: Path, out_dir: Path, release: str = "test", namespace: str = "default", values_file: Optional[Path] = None) -> Tuple[bool, Path, str]:
+def chart_has_dependencies(chart_dir: Path) -> bool:
+    chart_yaml = chart_dir / "Chart.yaml"
+    if not chart_yaml.exists():
+        return False
+    try:
+        obj = yaml.safe_load(chart_yaml.read_text(encoding="utf-8", errors="ignore")) or {}
+        deps = obj.get("dependencies")
+        return isinstance(deps, list) and len(deps) > 0
+    except Exception:
+        return False
+
+
+def extract_values_paths_from_helm_error(stderr: str) -> List[str]:
+    paths: List[str] = []
+    if not stderr:
+        return paths
+    for m in re.finditer(r"<\.Values\.([^>]+)>", stderr):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        # Keep only helm-safe key path characters.
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "", raw)
+        if safe:
+            paths.append(safe)
+    return list(dict.fromkeys(paths))
+
+
+def build_nil_pointer_set_flags(value_paths: List[str], max_items: int = 20) -> List[str]:
+    flags: List[str] = []
+    for p in value_paths[:max_items]:
+        flags.extend(["--set-string", f"{p}="])
+    return flags
+
+
+def default_helm_fallback_set_flags() -> List[str]:
+    # Common missing keys found in this dataset.
+    return [
+        "--set-string", "global.restapi.jvm.maxheapmemory=",
+        "--set-string", "global.restapi.jvm.minheapmemory=",
+    ]
+
+
+def helm_template(
+    chart_dir: Path,
+    out_dir: Path,
+    release: str = "test",
+    namespace: str = "default",
+    values_file: Optional[Path] = None,
+    template_timeout: int = 240,
+    dependency_timeout: int = 90,
+    skip_dependency_build: bool = False,
+) -> Tuple[bool, Path, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_yaml = out_dir / "rendered.yaml"
 
-    if (chart_dir / "Chart.yaml").exists():
-        run(["helm", "dependency", "build", str(chart_dir)], timeout=600)
+    dep_note = ""
+    base_cmd = ["helm", "template", release, str(chart_dir), "--namespace", namespace]
+    if values_file and values_file.exists():
+        base_cmd += ["-f", str(values_file)]
+
+    if not skip_dependency_build and chart_has_dependencies(chart_dir):
+        dep_cmd = ["helm", "dependency", "build", "--skip-refresh", str(chart_dir)]
+        dep_code, _, dep_err = run(dep_cmd, timeout=dependency_timeout)
+        if dep_code != 0:
+            dep_note = f"; dependency_build_failed: {dep_err.strip()[:180]}"
+            # Retry with refresh once for repos not cached locally.
+            dep_cmd_refresh = ["helm", "dependency", "build", str(chart_dir)]
+            dep_code2, _, dep_err2 = run(dep_cmd_refresh, timeout=max(dependency_timeout, 120))
+            if dep_code2 == 0:
+                dep_note += "; dependency_build_retry_ok"
+            else:
+                dep_note += f"; dependency_build_retry_failed: {dep_err2.strip()[:180]}"
 
     strategies = [
-        ["helm", "template", release, str(chart_dir), "--namespace", namespace] + (["-f", str(values_file)] if values_file and values_file.exists() else []),
+        base_cmd,
         ["helm", "template", release, str(chart_dir), "--namespace", namespace],
-        [
-            "helm", "template", release, str(chart_dir), "--namespace", namespace,
-            "--set", "global.restapi.jvm.maxheapmemory=''",
-            "--set", "global.restapi.jvm.minheapmemory=''",
-            "--set", "Values={}"
-        ],
+        ["helm", "template", release, str(chart_dir), "--namespace", namespace] + default_helm_fallback_set_flags(),
     ]
     last_err = ""
+    nilptr_retry_signatures: Set[str] = set()
+    nilptr_accumulated_paths: Set[str] = set()
+    chart_name = chart_dir.name
     for attempt, cmd in enumerate(strategies, 1):
-        code, stdout, stderr = run(cmd, timeout=900)
+        code, stdout, stderr = run(cmd, timeout=template_timeout)
         if code == 0 and stdout.strip():
             out_yaml.write_text(stdout, encoding="utf-8")
-            return True, out_yaml, f"ok_strategy_{attempt}"
+            return True, out_yaml, f"ok_strategy_{attempt}{dep_note}"
         last_err = stderr.strip()[:300]
-    return False, out_yaml, f"helm_template_all_strategies_failed: {last_err}"
+
+        if "nil pointer evaluating interface" in (stderr or ""):
+            all_paths = extract_values_paths_from_helm_error(stderr or "")
+            if all_paths:
+                preferred_paths = [p for p in all_paths if f".{chart_name}." in f".{p}."]
+                value_paths = preferred_paths or all_paths
+                for p in value_paths:
+                    nilptr_accumulated_paths.add(p)
+                merged_paths = sorted(nilptr_accumulated_paths)
+                signature = ",".join(merged_paths[:20])
+                if signature and signature not in nilptr_retry_signatures:
+                    nil_cmd = list(base_cmd) + default_helm_fallback_set_flags() + build_nil_pointer_set_flags(merged_paths)
+                    strategies.append(nil_cmd)
+                    nilptr_retry_signatures.add(signature)
+                    dep_note += f"; nilptr_autoset_paths={','.join(merged_paths[:5])}"
+
+    return False, out_yaml, f"helm_template_all_strategies_failed: {last_err}{dep_note}"
 
 
 # ---------------------------
@@ -238,12 +340,20 @@ WORKLOAD_KINDS = {
     ("v1", "Pod"),
 }
 
+WORKLOAD_KIND_NAMES = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod"}
+
 
 def iter_yaml_docs(yaml_path: Path) -> Iterable[Dict[str, Any]]:
-    text = yaml_path.read_text(encoding="utf-8", errors="ignore")
-    for doc in yaml.safe_load_all(text):
-        if isinstance(doc, dict):
-            yield doc
+    try:
+        text = yaml_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return
+    try:
+        for doc in yaml.safe_load_all(text):
+            if isinstance(doc, dict):
+                yield doc
+    except Exception:
+        return
 
 
 def get_podspec(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -257,6 +367,49 @@ def get_podspec(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if kind == "CronJob":
         return spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec")
     return spec.get("template", {}).get("spec")
+
+
+def get_podspec_loose(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fallback parser by kind name only, for non-standard/legacy apiVersion manifests."""
+    kind = str(obj.get("kind") or "")
+    if kind not in WORKLOAD_KIND_NAMES:
+        return None
+    if kind == "Pod":
+        return obj.get("spec")
+    spec = obj.get("spec", {}) or {}
+    if kind == "CronJob":
+        return spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec")
+    return spec.get("template", {}).get("spec")
+
+
+def find_repo_manifest_yaml_files(repo_dir: Path, max_files: int = 5000) -> List[Path]:
+    skip_dir_names = {
+        ".git", ".venv", "venv", "node_modules", "vendor", "dist", "build", "target",
+        "dataset", "outputs", "binaries", "scripts",
+    }
+    out: List[Path] = []
+    seen: Set[Path] = set()
+    patterns = ("*.yaml", "*.yml")
+    for pattern in patterns:
+        for p in repo_dir.rglob(pattern):
+            if len(out) >= max_files:
+                return sorted(out, key=lambda x: str(x))
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                rel_parts = p.relative_to(repo_dir).parts[:-1]
+            except Exception:
+                rel_parts = p.parts[:-1]
+            if any(part in skip_dir_names for part in rel_parts):
+                continue
+            try:
+                if p.stat().st_size > 1_500_000:
+                    continue
+            except Exception:
+                continue
+            out.append(p)
+    return sorted(out, key=lambda x: str(x))
 
 
 def obj_meta_name(obj: Dict[str, Any]) -> str:
@@ -307,11 +460,32 @@ class StartupResolution:
 # Docker helpers
 # ---------------------------
 
+
+def docker_image_exists_locally(image: str) -> bool:
+    code, out, _ = run(["docker", "image", "inspect", image], timeout=60)
+    return code == 0 and out.strip().startswith("[")
+
+
 def docker_pull(image: str, timeout: int = 300) -> Tuple[bool, str]:
+    # Try native pull first
     code, _, err = run(["docker", "pull", image], timeout=timeout)
-    if code != 0:
-        return False, err.strip()[:500]
-    return True, "ok"
+    if code == 0:
+        return True, "ok"
+    
+    err_msg = err.strip()
+    # If it fails and mentions ARM64/manifest, try amd64 fallback
+    if "arm64" in err_msg.lower() or "manifest" in err_msg.lower() or "not found" in err_msg.lower():
+        log_debug(f"native pull failed ({err_msg[:100]}), trying amd64 fallback...")
+        # Try with explicit platform
+        code2, _, err2 = run(["docker", "pull", "--platform", "linux/amd64", image], timeout=timeout)
+        if code2 == 0:
+            return True, "ok_amd64_fallback"
+        # Also return the amd64 error code if primary error was architecture-related
+        if "arm64" in err_msg.lower() or "manifest" in err_msg.lower():
+            # For architecture mismatches, we'll skip this image gracefully
+            return False, f"architecture_mismatch: {err_msg[:300]}"
+    
+    return False, err_msg[:500]
 
 
 def is_private_registry_image(image: str) -> bool:
@@ -399,6 +573,51 @@ def docker_resolve_executable(image: str, exe: str) -> Optional[str]:
     return path if path.startswith("/") else None
 
 
+def docker_resolve_executables_batch(image: str, candidates: List[str], timeout: int = 180) -> Dict[str, str]:
+    uniq: List[str] = []
+    seen: Set[str] = set()
+    for c in candidates:
+        s = (c or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    if not uniq:
+        return {}
+
+    script = (
+        'for c in "$@"; do '
+        '  [ -z "$c" ] && continue; '
+        '  case "$c" in '
+        '    /*) if [ -e "$c" ]; then printf "%s\\t%s\\n" "$c" "$c"; fi ;; '
+        '    *) '
+        '      p=$(command -v "$c" 2>/dev/null || true); '
+        '      if [ -n "$p" ]; then printf "%s\\t%s\\n" "$c" "$p"; continue; fi; '
+        '      for d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do '
+        '        if [ -e "$d/$c" ]; then printf "%s\\t%s\\n" "$c" "$d/$c"; break; fi; '
+        '      done ;; '
+        '  esac; '
+        'done'
+    )
+    code, out, _ = run(
+        ["docker", "run", "--rm", "--entrypoint", "/bin/sh", image, "-c", script, "_"] + uniq,
+        timeout=timeout,
+    )
+    if code != 0:
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for line in out.splitlines():
+        if "\t" not in line:
+            continue
+        left, right = line.split("\t", 1)
+        left = left.strip()
+        right = right.strip()
+        if left and right.startswith("/"):
+            mapping[left] = right
+    return mapping
+
+
 # ---------------------------
 # Command / script parsing helpers
 # ---------------------------
@@ -441,6 +660,49 @@ def is_shell_script_path(token: str) -> bool:
     if token.endswith(SCRIPT_EXTS):
         return True
     return token.startswith("/") and ("/bin/" not in token or token.endswith(".sh")) and token.count("/") >= 2 and "." in Path(token).name
+
+
+def is_executable_like_token(tok: str) -> bool:
+    t = (tok or "").strip().strip('"\'')
+    if not t:
+        return False
+    if t in SKIP_BUILTINS:
+        return False
+    if t.startswith("$") or t.startswith("`"):
+        return False
+    if t.endswith("()"):
+        return False
+    if "=" in t and not t.startswith("/"):
+        return False
+    if any(x in t for x in ["(", ")", "{", "}"]):
+        return False
+    return True
+
+
+def select_entries_for_extraction(entries: List[ExecEntry], max_items: int = 24) -> List[ExecEntry]:
+    if not entries:
+        return []
+
+    def rank(e: ExecEntry) -> Tuple[int, int, int]:
+        return (
+            0 if e.kind == "daemon" else 1,
+            0 if e.pid1 else 1,
+            0 if e.exe.startswith("/") else 1,
+        )
+
+    selected: List[ExecEntry] = []
+    seen_exe: Set[str] = set()
+    for e in sorted(entries, key=rank):
+        exe = (e.exe or "").strip()
+        if not is_executable_like_token(exe):
+            continue
+        if exe in seen_exe:
+            continue
+        seen_exe.add(exe)
+        selected.append(e)
+        if len(selected) >= max_items:
+            break
+    return selected
 
 
 def dedup_entries(entries: List[ExecEntry]) -> List[ExecEntry]:
@@ -622,13 +884,29 @@ def extract_script_from_image(cid: str, image: str, script_path: str, dst_root: 
     return None, "script_copy_failed"
 
 
-def resolve_startup_chain(container: Dict[str, Any], image: str) -> StartupResolution:
-    image_entry, image_cmd, image_env, _ = docker_image_config(image) if image else (None, None, {}, "")
+def resolve_startup_chain(container: Dict[str, Any], image: str, skip_image_config: bool = False) -> StartupResolution:
+    """Resolve startup chain from K8s manifest + image config.
+    
+    Args:
+        container: K8s container spec
+        image: Container image name
+        skip_image_config: If True, only use manifest command/args, skip image config fetch
+    """
+    image_entry, image_cmd, image_env = None, None, {}
+    
+    if image and not skip_image_config:
+        image_entry, image_cmd, image_env, _ = docker_image_config(image)
+    
     env = parse_container_env(container, image_env)
     final_cmdline = normalize_full_command(container.get("command"), container.get("args"), image_entry, image_cmd)
     notes: List[str] = []
+    
     if not final_cmdline:
-        return StartupResolution([], [], [], [], ["no_final_cmdline"])
+        msg = "no_final_cmdline"
+        if skip_image_config:
+            msg = "no_final_cmdline_manifest_only"
+        return StartupResolution([], [], [], [], [msg])
+    
     entries, scripts, used, parse_notes = parse_cmdline_entries(final_cmdline, env)
     notes.extend(parse_notes)
     return StartupResolution(final_cmdline, entries, scripts, sorted(used), notes)
@@ -763,18 +1041,41 @@ def get_binary_build_info(binary_path: Path) -> Dict[str, Any]:
         code, out, err = run(['go', 'version', '-m', str(binary_path)], timeout=120)
     except Exception:
         return info
-    txt = (out or '') + ('\n' + err if err else '')
+
+    stdout = out or ''
+    stderr = err or ''
+    txt = stdout + ('\n' + stderr if stderr else '')
     info['raw'] = txt[:4000]
-    if code != 0 or not txt.strip():
+
+    if code != 0 or not stdout.strip():
         return info
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    if lines:
-        info['is_go_binary'] = True
+
+    lines = [ln.rstrip() for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        return info
+
+    has_go_metadata = False
+    for ln in lines[1:]:
+        s = ln.strip()
+        if (
+            s.startswith('path\t')
+            or s.startswith('mod\t')
+            or s.startswith('build\t')
+            or s.startswith('dep\t')
+        ):
+            has_go_metadata = True
+            break
+
+    if not has_go_metadata:
+        return info
+
+    info['is_go_binary'] = True
     for ln in lines:
-        if ln.startswith('path\t'):
-            info['path'] = ln.split('\t', 1)[1].strip()
-        elif ln.startswith('mod\t'):
-            parts = ln.split('\t')
+        s = ln.strip()
+        if s.startswith('path\t'):
+            info['path'] = s.split('\t', 1)[1].strip()
+        elif s.startswith('mod\t'):
+            parts = s.split('\t')
             if len(parts) >= 2:
                 info['go_main'] = parts[1].strip()
     return info
@@ -805,7 +1106,6 @@ def match_binary_to_entrypoints(binary_path: Path, repo_dir: Path, candidate_mai
     if not candidate_main_files:
         return MatchEvidence([], 0, 'no_candidate_mains', ['repo_has_no_detected_main_go'], {}, [])
 
-    token_map = build_candidate_tokens(repo_dir, candidate_main_files, go_modules)
     build_info = get_binary_build_info(binary_path)
     lines = collect_binary_strings(binary_path)
     if not lines and not build_info.get('is_go_binary'):
@@ -855,9 +1155,20 @@ def match_binary_to_entrypoints(binary_path: Path, repo_dir: Path, candidate_mai
                 if pkg_file in line:
                     add_reason(rel, 6, f'module_file:{pkg_file}', line)
 
+    go_markers_in_strings = False
+    if lines:
+        probe = '\n'.join(lines[:2000]).lower()
+        go_markers_in_strings = (
+            'go build id' in probe
+            or '/src/runtime/runtime.go' in probe
+            or 'gopclntab' in probe
+            or 'command-line-arguments' in probe
+        )
+    has_go_signal = bool(build_info.get('is_go_binary')) or go_markers_in_strings
+
     if not scores:
         reasons = []
-        if build_info.get('is_go_binary'):
+        if has_go_signal:
             reasons.append('go_binary_detected_but_no_repo_path_or_module_evidence')
             status = 'repo_mismatch_or_trimpath'
         else:
@@ -869,17 +1180,159 @@ def match_binary_to_entrypoints(binary_path: Path, repo_dir: Path, candidate_mai
 
     top_score = max(scores.values())
     matched = sorted([rel for rel, sc in scores.items() if sc == top_score])
-    if top_score >= 8:
+
+    if top_score >= 8 and has_go_signal:
         status = 'exact_or_strong_match'
-    elif top_score >= 4:
+    elif top_score >= 4 and has_go_signal:
         status = 'likely_match'
+    elif top_score >= 4:
+        status = 'path_match_without_go_signal'
     else:
         status = 'weak_match'
+
     reasons: List[str] = []
     for rel in matched[:5]:
         reasons.extend(sorted(reasons_by_rel.get(rel, set())))
+    if not has_go_signal:
+        reasons.append('matched_by_path_tokens_without_strong_go_markers')
+
     return MatchEvidence(matched, top_score, status, reasons[:20], build_info, sample_hits)
 
+def detect_binary_language(binary_path: Path) -> Dict[str, Any]:
+    """Best-effort language detection for an extracted binary or script.
+
+    Returns keys: language, is_go, detail, file_output.
+    """
+    result: Dict[str, Any] = {
+        'language': 'Unknown',
+        'is_go': False,
+        'detail': '',
+        'file_output': '',
+    }
+
+    # 1) First inspect shebang / file type so interpreter wrappers do not get
+    #    misclassified as Go just because another tool returns noisy output.
+    file_out = ''
+    if shutil.which('file') is not None:
+        try:
+            code, out, err = run(['file', '-b', str(binary_path)], timeout=60)
+            file_out = (out or err or '').strip()
+        except Exception:
+            file_out = ''
+    result['file_output'] = file_out[:400]
+    low = file_out.lower()
+
+    try:
+        head = binary_path.read_bytes()[:4096]
+        head_text = head.decode('utf-8', errors='ignore')
+    except Exception:
+        head_text = ''
+    head_low = head_text.lower()
+
+    if head_text.startswith('#!'):
+        if 'python' in head_low:
+            result.update({'language': 'Python', 'detail': 'shebang:python'})
+            return result
+        if 'node' in head_low or 'javascript' in head_low:
+            result.update({'language': 'JavaScript', 'detail': 'shebang:node'})
+            return result
+        if 'ruby' in head_low:
+            result.update({'language': 'Ruby', 'detail': 'shebang:ruby'})
+            return result
+        if 'php' in head_low:
+            result.update({'language': 'PHP', 'detail': 'shebang:php'})
+            return result
+        if 'sh' in head_low or 'bash' in head_low or 'ash' in head_low or 'zsh' in head_low:
+            result.update({'language': 'Shell', 'detail': 'shebang:shell'})
+            return result
+
+    if 'shell script' in low or 'bourne-again shell script' in low or 'posix shell script' in low:
+        result.update({'language': 'Shell', 'detail': file_out[:400]})
+        return result
+    if 'go buildid=' in low or 'go build id' in low:
+        result.update({'language': 'Go', 'is_go': True, 'detail': file_out[:400]})
+        return result
+    if 'python script' in low or 'python byte-compiled' in low or re.search(r'\bpython\b', low):
+        result.update({'language': 'Python', 'detail': file_out[:400]})
+        return result
+    if 'java class data' in low or 'jar' in low or 'java archive' in low:
+        result.update({'language': 'Java', 'detail': file_out[:400]})
+        return result
+    if 'node.js script' in low or 'javascript' in low:
+        result.update({'language': 'JavaScript', 'detail': file_out[:400]})
+        return result
+    if 'ruby script' in low or re.search(r'\bruby\b', low):
+        result.update({'language': 'Ruby', 'detail': file_out[:400]})
+        return result
+    if 'php script' in low or re.search(r'\bphp\b', low):
+        result.update({'language': 'PHP', 'detail': file_out[:400]})
+        return result
+
+    # 2) Strong Go signal: go build metadata. Require real metadata, not merely
+    #    any output from `go version -m`.
+    build_info = get_binary_build_info(binary_path)
+    if build_info.get('is_go_binary'):
+        detail = build_info.get('path') or build_info.get('go_main') or 'go version -m matched'
+        result.update({
+            'language': 'Go',
+            'is_go': True,
+            'detail': str(detail)[:400],
+        })
+        return result
+
+    # 3) strings-based heuristics as fallback
+    lines = collect_binary_strings(binary_path, max_lines=8000)
+    joined = ''.join(lines[:2000]).lower()
+    if 'go build id' in joined or '/src/runtime/runtime.go' in joined or 'command-line-arguments' in joined or 'gopclntab' in joined:
+        result.update({'language': 'Go', 'is_go': True, 'detail': 'strings heuristic: go markers'})
+        return result
+    if 'python' in joined and ('site-packages' in joined or 'pyc' in joined or '__main__' in joined):
+        result.update({'language': 'Python', 'detail': 'strings heuristic: python markers'})
+        return result
+    if 'openjdk' in joined or 'java/lang/' in joined or 'kotlin/' in joined:
+        result.update({'language': 'Java', 'detail': 'strings heuristic: jvm markers'})
+        return result
+    if 'node_modules' in joined or 'node.js' in joined or 'npm' in joined:
+        result.update({'language': 'JavaScript', 'detail': 'strings heuristic: node markers'})
+        return result
+
+    if 'elf' in low or 'mach-o' in low or 'pe32' in low or 'executable' in low or 'shared object' in low:
+        result.update({'language': 'Native/Unknown', 'detail': file_out[:400]})
+    else:
+        result.update({'language': 'Unknown', 'detail': (file_out or 'no reliable language markers')[:400]})
+    return result
+
+
+def summarize_binary_language_records(records: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    for rec in records:
+        binary = Path(rec.get("binary", "")).name or rec.get("binary", "")
+        lang = rec.get("language", "Unknown")
+        is_go = rec.get("is_go", False)
+        detail = rec.get("detail", "")
+        suffix = f" detail={detail}" if detail else ""
+        lines.append(f"{binary}: language={lang} is_go={str(is_go).lower()}{suffix}")
+    return lines
+
+
+def summarize_repo_mismatch(container_result: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    status = container_result.get("match_status", "")
+    if status == "repo_mismatch_or_trimpath":
+        for rec in container_result.get("binary_languages", []) or []:
+            binary = Path(rec.get("binary", "")).name or rec.get("binary", "")
+            lines.append(f"{binary}: likely not in this repo")
+    return lines
+
+
+def summarize_entry_matches(container_result: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    bins = [Path(x).name for x in (container_result.get("extracted_binaries", []) or [])]
+    entrys = container_result.get("matched_code_entrypoints", []) or []
+    if entrys:
+        prefix = ", ".join(bins) if bins else container_result.get("container_name", "")
+        lines.append(f"{prefix}: entrypoints=" + ", ".join(entrys))
+    return lines
 
 # ---------------------------
 # Reports
@@ -902,6 +1355,7 @@ class ContainerResult:
     match_status: str
     match_score: int
     binary_build_info: List[Dict[str, Any]]
+    binary_languages: List[Dict[str, Any]]
     match_evidence: List[str]
     sample_hits: List[str]
     notes: str
@@ -919,6 +1373,8 @@ class RepoResult:
     rendered_manifests: List[str]
     containers: List[Dict[str, Any]]
     errors: List[str]
+    parsed_objects: int = 0
+    podspec_objects: int = 0
 
 
 # ---------------------------
@@ -931,26 +1387,298 @@ def manifest_cmdline_only(container: Dict[str, Any]) -> List[str]:
     return cmd + args
 
 
-def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, namespace: str = "default", no_docker: bool = False, skip_private_registry: bool = True, pull_timeout: int = 300) -> RepoResult:
+def split_notes(notes: str) -> List[str]:
+    if not notes:
+        return []
+    return [x.strip() for x in notes.split(";") if x.strip()]
+
+
+def collect_zero_reasons_for_container(c: Dict[str, Any], repo: RepoResult) -> List[str]:
+    reasons: List[str] = []
+    notes = split_notes(str(c.get("notes") or ""))
+    bins = c.get("extracted_binaries") or []
+    matches = c.get("matched_code_entrypoints") or []
+    final_cmd = str(c.get("final_cmdline") or "").strip()
+    candidate_mains_count = int(c.get("candidate_mains_count") or 0)
+
+    if not repo.charts_found:
+        reasons.append("no_chart")
+    if not repo.rendered_manifests and repo.charts_found:
+        reasons.append("no_rendered_manifest")
+    if repo.rendered_manifests and len(repo.containers) == 0:
+        reasons.append("no_podspec_or_no_containers")
+
+    if not final_cmd:
+        reasons.append("no_cmd")
+    if any(n.startswith("docker_pull_failed:") for n in notes):
+        reasons.append("image_unpullable")
+    if "private_registry_skipped" in notes:
+        reasons.append("image_private_skipped")
+    if "docker_skipped" in notes:
+        reasons.append("docker_skipped")
+    if not bins:
+        reasons.append("no_extracted_binaries")
+    if not matches:
+        reasons.append("no_entrypoint_match")
+    if candidate_mains_count == 0:
+        reasons.append("no_go_mains")
+
+    status = str(c.get("match_status") or "")
+    if status:
+        reasons.append(f"match_status:{status}")
+
+    return sorted(set(reasons))
+
+
+def build_zero_diagnostic_rows(rr: RepoResult) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    if not rr.containers:
+        repo_reasons: List[str] = []
+        if not rr.repo_ok:
+            repo_reasons.append("repo_unavailable")
+        if not rr.charts_found:
+            repo_reasons.append("no_chart")
+        if rr.charts_found and not rr.rendered_manifests:
+            repo_reasons.append("no_rendered_manifest")
+        if rr.rendered_manifests and rr.podspec_objects == 0:
+            repo_reasons.append("no_podspec")
+        if rr.rendered_manifests and rr.podspec_objects > 0:
+            repo_reasons.append("no_containers")
+        if rr.errors:
+            repo_reasons.append("render_or_repo_errors")
+
+        rows.append({
+            "repo_url": rr.repo_url,
+            "workload": "",
+            "kind": "",
+            "container_name": "",
+            "image": "",
+            "charts_found": len(rr.charts_found),
+            "rendered_manifests": len(rr.rendered_manifests),
+            "parsed_objects": rr.parsed_objects,
+            "podspec_objects": rr.podspec_objects,
+            "binaries_extracted": 0,
+            "entrypoints_matched": 0,
+            "zero_reasons": ";".join(sorted(set(repo_reasons)) or ["no_container_records"]),
+            "notes": rr.repo_detail or ";".join(rr.errors),
+        })
+        return rows
+
+    for c in rr.containers:
+        bins = c.get("extracted_binaries") or []
+        matches = c.get("matched_code_entrypoints") or []
+        rows.append({
+            "repo_url": rr.repo_url,
+            "workload": c.get("workload", ""),
+            "kind": c.get("kind", ""),
+            "container_name": c.get("container_name", ""),
+            "image": c.get("image", ""),
+            "charts_found": len(rr.charts_found),
+            "rendered_manifests": len(rr.rendered_manifests),
+            "parsed_objects": rr.parsed_objects,
+            "podspec_objects": rr.podspec_objects,
+            "binaries_extracted": len(bins),
+            "entrypoints_matched": len(matches),
+            "zero_reasons": ";".join(collect_zero_reasons_for_container(c, rr)),
+            "notes": str(c.get("notes") or ""),
+        })
+    return rows
+
+
+def analyze_repo(
+    repo_dir: Path,
+    source_csv: str,
+    repo_url: str,
+    out_dir: Path,
+    namespace: str = "default",
+    no_docker: bool = False,
+    skip_private_registry: bool = True,
+    pull_timeout: int = 300,
+    helm_template_timeout: int = 240,
+    helm_dependency_timeout: int = 90,
+    helm_skip_dependency_build: bool = False,
+    max_entry_extract: int = 24,
+) -> RepoResult:
     charts = find_chart_dirs(repo_dir)
-    print(f" [DEBUG] Found {len(charts)} charts")
+    log_debug(f"Found {len(charts)} charts")
     rendered_paths: List[str] = []
     container_results: List[Dict[str, Any]] = []
     errors: List[str] = []
+    total_obj_count = 0
+    total_podspec_count = 0
     candidate_mains = scan_repo_go_entrypoints(repo_dir)
     go_modules = discover_go_modules(repo_dir)
-    print(f" [DEBUG] candidate_mains={len(candidate_mains)} go_modules={len(go_modules)}")
+    log_debug(f"candidate_mains={len(candidate_mains)} go_modules={len(go_modules)}")
+
+    def process_container(c: Dict[str, Any], wname: str, wkind: str, section: str, source_tag: str) -> None:
+        cname = c.get("name", "")
+        image = c.get("image", "")
+        startup = resolve_startup_chain(c, image, skip_image_config=True)
+        extracted_bins: List[str] = []
+        matched_entrypoints: List[str] = []
+        binary_build_infos: List[Dict[str, Any]] = []
+        binary_languages: List[Dict[str, Any]] = []
+        match_evidence_lines: List[str] = []
+        sample_hits: List[str] = []
+        best_match_status = "not_attempted"
+        best_match_score = 0
+        notes: List[str] = [f"source:{source_tag}"]
+
+        if image and not no_docker:
+            if skip_private_registry and is_private_registry_image(image):
+                notes.append("private_registry_skipped")
+                log_info(f"skip private image: {image}")
+                if startup.final_cmdline:
+                    notes.append("manifest_only_startup")
+            else:
+                if docker_image_exists_locally(image):
+                    log_debug(f"image already exists locally, skip pull: {image}")
+                    pull_ok, pull_msg = True, "already_present_local"
+                else:
+                    log_debug(f"pulling image: {image}")
+                    pull_ok, pull_msg = docker_pull(image, timeout=pull_timeout)
+
+                if not pull_ok:
+                    notes.append(f"docker_pull_failed:{pull_msg}")
+                    startup = resolve_startup_chain(c, image, skip_image_config=True)
+                    if startup.final_cmdline:
+                        notes.append("manifest_only_startup")
+                else:
+                    cid, cmsg = docker_create(image)
+                    if not cid:
+                        notes.append(f"docker_create_failed:{cmsg}")
+                        startup = resolve_startup_chain(c, image, skip_image_config=True)
+                        if startup.final_cmdline:
+                            notes.append("manifest_only_due_to_create_fail")
+                    else:
+                        try:
+                            startup = resolve_startup_chain(c, image)
+                            startup = enrich_entries_with_scripts(
+                                cid,
+                                image,
+                                startup,
+                                out_dir / "scripts" / safe_repo_dir_name(repo_url) / wkind / wname / section / cname,
+                            )
+                            notes.extend(startup.notes)
+                            extract_entries = select_entries_for_extraction(startup.entries, max_items=max_entry_extract)
+                            if len(startup.entries) > len(extract_entries):
+                                notes.append(f"entry_extract_limited:{len(extract_entries)}/{len(startup.entries)}")
+
+                            exe_map = docker_resolve_executables_batch(
+                                image,
+                                [e.exe for e in extract_entries],
+                                timeout=120,
+                            )
+
+                            for e in extract_entries:
+                                exe_path = exe_map.get((e.exe or "").strip())
+                                if not exe_path:
+                                    notes.append(f"resolve_failed:{e.exe}")
+                                    continue
+                                safe_bin_name = exe_path.lstrip('/').replace('/', '__') or Path(exe_path).name
+                                local_bin = out_dir / "binaries" / safe_repo_dir_name(repo_url) / wkind / wname / section / cname / safe_bin_name
+                                okcp, _ = docker_cp_from_container(cid, exe_path, local_bin)
+                                if not okcp:
+                                    notes.append(f"copy_failed:{exe_path}")
+                                    continue
+                                if not local_bin.exists() or not local_bin.is_file():
+                                    notes.append(f"copied_non_file:{exe_path}")
+                                    continue
+                                extracted_bins.append(str(local_bin))
+                                lang_info = detect_binary_language(local_bin)
+                                binary_languages.append({
+                                    'binary': str(local_bin),
+                                    **lang_info,
+                                })
+                                if not lang_info.get('is_go'):
+                                    reason = f"{Path(local_bin).name}:non_go_or_unknown:{lang_info.get('language','unknown')}"
+                                    match_evidence_lines.append(reason)
+                                    if lang_info.get('detail'):
+                                        sample_hits.append(f"{Path(local_bin).name}:{lang_info.get('detail')}")
+
+                                mev = match_binary_to_entrypoints(local_bin, repo_dir, candidate_mains, go_modules)
+                                binary_build_infos.append({
+                                    'binary': str(local_bin),
+                                    **mev.build_info,
+                                })
+                                if mev.matched_entrypoints:
+                                    matched_entrypoints.extend(mev.matched_entrypoints)
+                                if mev.reasons:
+                                    match_evidence_lines.extend([f"{Path(local_bin).name}:{r}" for r in mev.reasons])
+                                if mev.sample_hits:
+                                    sample_hits.extend([f"{Path(local_bin).name}:{s}" for s in mev.sample_hits])
+                                if mev.score > best_match_score:
+                                    best_match_score = mev.score
+                                    best_match_status = mev.status
+                                elif best_match_status == "not_attempted" or best_match_status == 'skipped_non_go':
+                                    best_match_status = mev.status
+                        finally:
+                            docker_rm(cid)
+        elif no_docker:
+            notes.append("docker_skipped")
+            if startup.final_cmdline:
+                notes.append("manifest_only_startup")
+
+        if best_match_status == "not_attempted":
+            if not extracted_bins:
+                best_match_status = "no_extracted_binaries"
+            elif candidate_mains == []:
+                best_match_status = "no_candidate_mains"
+
+        container_results.append(asdict(ContainerResult(
+            workload=wname,
+            kind=wkind,
+            container_name=f"{section}:{cname}",
+            image=image,
+            manifest_cmdline=" ".join(manifest_cmdline_only(c)),
+            final_cmdline=" ".join(startup.final_cmdline),
+            scripts_considered=startup.scripts_considered,
+            env_keys_used=startup.env_keys_used,
+            derived_entries=[asdict(e) for e in startup.entries],
+            extracted_binaries=sorted(set(extracted_bins)),
+            matched_code_entrypoints=sorted(set(matched_entrypoints)),
+            candidate_mains_count=len(candidate_mains),
+            repo_go_modules=go_modules[:20],
+            match_status=best_match_status,
+            match_score=best_match_score,
+            binary_build_info=binary_build_infos,
+            binary_languages=binary_languages,
+            match_evidence=sorted(set(match_evidence_lines))[:50],
+            sample_hits=sorted(set(sample_hits))[:20],
+            notes=";".join(notes),
+        )))
+        log_debug(
+            f"{section}:{cname} | image={image} | final_cmd={len(startup.final_cmdline)} | "
+            f"scripts={len(startup.scripts_considered)} | entries={len(startup.entries)} {format_entries_for_log(startup.entries)} | "
+            f"bins={len(set(extracted_bins))} | matches={len(set(matched_entrypoints))} | status={best_match_status} | score={best_match_score}"
+        )
 
     for chart_dir in charts:
         chart_out = out_dir / "rendered" / chart_dir.relative_to(repo_dir)
-        ok, rendered_yaml, msg = helm_template(chart_dir, chart_out, release="test", namespace=namespace, values_file=None)
+        ok, rendered_yaml, msg = helm_template(
+            chart_dir,
+            chart_out,
+            release="test",
+            namespace=namespace,
+            values_file=None,
+            template_timeout=helm_template_timeout,
+            dependency_timeout=helm_dependency_timeout,
+            skip_dependency_build=helm_skip_dependency_build,
+        )
         if not ok:
+            if "missing in charts/ directory" in msg:
+                subcharts_dir = chart_dir / "charts"
+                has_local_subcharts = subcharts_dir.exists() and any(subcharts_dir.rglob("Chart.yaml"))
+                if has_local_subcharts:
+                    log_info(f"skip parent chart render due to missing dependencies: {chart_dir}")
+                    continue
             render_err = f"helm_template_failed: {chart_dir}: {msg}"
-            print(f" [WARN] {render_err}")
+            log_warn(render_err)
             errors.append(render_err)
             continue
         rendered_paths.append(str(rendered_yaml))
-        print(f" [DEBUG] Rendered: {rendered_yaml}")
+        log_debug(f"Rendered: {rendered_yaml}")
 
         obj_count = 0
         podspec_count = 0
@@ -965,109 +1693,37 @@ def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, 
 
             for section in ["initContainers", "containers"]:
                 for c in (podspec.get(section, []) or []):
-                    cname = c.get("name", "")
-                    image = c.get("image", "")
-                    startup = StartupResolution([], [], [], [], ["docker_not_run"])
-                    extracted_bins: List[str] = []
-                    matched_entrypoints: List[str] = []
-                    binary_build_infos: List[Dict[str, Any]] = []
-                    match_evidence_lines: List[str] = []
-                    sample_hits: List[str] = []
-                    best_match_status = "not_attempted"
-                    best_match_score = 0
-                    notes: List[str] = []
+                    process_container(c, wname, wkind, section, source_tag="helm")
 
-                    if image and not no_docker:
-                        if skip_private_registry and is_private_registry_image(image):
-                            notes.append("private_registry_skipped")
-                            print(f" [INFO] skip private image: {image}")
-                        else:
-                            print(f" [DEBUG] pulling image: {image}")
-                            pull_ok, pull_msg = docker_pull(image, timeout=pull_timeout)
-                            if not pull_ok:
-                                notes.append(f"docker_pull_failed:{pull_msg}")
-                            else:
-                                cid, cmsg = docker_create(image)
-                                if not cid:
-                                    notes.append(f"docker_create_failed:{cmsg}")
-                                else:
-                                    try:
-                                        startup = resolve_startup_chain(c, image)
-                                        startup = enrich_entries_with_scripts(
-                                            cid,
-                                            image,
-                                            startup,
-                                            out_dir / "scripts" / safe_repo_dir_name(repo_url) / wkind / wname / section / cname,
-                                        )
-                                        notes.extend(startup.notes)
-                                        for e in startup.entries:
-                                            exe_path = docker_resolve_executable(image, e.exe)
-                                            if not exe_path:
-                                                notes.append(f"resolve_failed:{e.exe}")
-                                                continue
-                                            local_bin = out_dir / "binaries" / safe_repo_dir_name(repo_url) / wkind / wname / section / cname / Path(exe_path).name
-                                            okcp, _ = docker_cp_from_container(cid, exe_path, local_bin)
-                                            if not okcp:
-                                                notes.append(f"copy_failed:{exe_path}")
-                                                continue
-                                            extracted_bins.append(str(local_bin))
-                                            mev = match_binary_to_entrypoints(local_bin, repo_dir, candidate_mains, go_modules)
-                                            binary_build_infos.append({
-                                                'binary': str(local_bin),
-                                                **mev.build_info,
-                                            })
-                                            if mev.matched_entrypoints:
-                                                matched_entrypoints.extend(mev.matched_entrypoints)
-                                            if mev.reasons:
-                                                match_evidence_lines.extend([f"{Path(local_bin).name}:{r}" for r in mev.reasons])
-                                            if mev.sample_hits:
-                                                sample_hits.extend([f"{Path(local_bin).name}:{s}" for s in mev.sample_hits])
-                                            if mev.score > best_match_score:
-                                                best_match_score = mev.score
-                                                best_match_status = mev.status
-                                            elif best_match_status == "not_attempted":
-                                                best_match_status = mev.status
-                                    finally:
-                                        docker_rm(cid)
-                    elif no_docker:
-                        notes.append("docker_skipped")
-
-                    if best_match_status == "not_attempted":
-                        if not extracted_bins:
-                            best_match_status = "no_extracted_binaries"
-                        elif candidate_mains == []:
-                            best_match_status = "no_candidate_mains"
-                    container_results.append(asdict(ContainerResult(
-                        workload=wname,
-                        kind=wkind,
-                        container_name=f"{section}:{cname}",
-                        image=image,
-                        manifest_cmdline=" ".join(manifest_cmdline_only(c)),
-                        final_cmdline=" ".join(startup.final_cmdline),
-                        scripts_considered=startup.scripts_considered,
-                        env_keys_used=startup.env_keys_used,
-                        derived_entries=[asdict(e) for e in startup.entries],
-                        extracted_binaries=sorted(set(extracted_bins)),
-                        matched_code_entrypoints=sorted(set(matched_entrypoints)),
-                        candidate_mains_count=len(candidate_mains),
-                        repo_go_modules=go_modules[:20],
-                        match_status=best_match_status,
-                        match_score=best_match_score,
-                        binary_build_info=binary_build_infos,
-                        match_evidence=sorted(set(match_evidence_lines))[:50],
-                        sample_hits=sorted(set(sample_hits))[:20],
-                        notes=";".join(notes),
-                    )))
-                    print(
-                        f" [DEBUG] {section}:{cname} | image={image} | final_cmd={len(startup.final_cmdline)} | "
-                        f"scripts={len(startup.scripts_considered)} | entries={len(startup.entries)} {format_entries_for_log(startup.entries)} | "
-                        f"bins={len(set(extracted_bins))} | matches={len(set(matched_entrypoints))} | status={best_match_status} | score={best_match_score}"
-                    )
+        total_obj_count += obj_count
+        total_podspec_count += podspec_count
 
         if obj_count == 0:
-            print(" [WARN] No K8s objects found in rendered manifest")
+            log_warn("No K8s objects found in rendered manifest")
         else:
-            print(f" [DEBUG] Parsed {obj_count} K8s objects, {podspec_count} with podspec")
+            log_debug(f"Parsed {obj_count} K8s objects, {podspec_count} with podspec")
+
+    if not charts:
+        raw_yaml_files = find_repo_manifest_yaml_files(repo_dir)
+        log_info(f"no chart found, fallback scanning yaml manifests: {len(raw_yaml_files)} files")
+        for yf in raw_yaml_files:
+            obj_count = 0
+            podspec_count = 0
+            for obj in iter_yaml_docs(yf):
+                obj_count += 1
+                podspec = get_podspec(obj) or get_podspec_loose(obj)
+                if not podspec:
+                    continue
+                podspec_count += 1
+                wname = obj_meta_name(obj) or yf.stem
+                wkind = obj.get("kind", "") or "UnknownKind"
+                rel_file = str(yf.relative_to(repo_dir))
+                for section in ["initContainers", "containers"]:
+                    for c in (podspec.get(section, []) or []):
+                        process_container(c, wname, wkind, section, source_tag=f"yaml:{rel_file}")
+
+            total_obj_count += obj_count
+            total_podspec_count += podspec_count
 
     return RepoResult(
         source_csv=source_csv,
@@ -1080,6 +1736,8 @@ def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, 
         rendered_manifests=rendered_paths,
         containers=container_results,
         errors=errors,
+        parsed_objects=total_obj_count,
+        podspec_objects=total_podspec_count,
     )
 
 
@@ -1097,8 +1755,16 @@ def main() -> int:
     ap.add_argument("--namespace", default="default", help="Namespace for helm template rendering")
     ap.add_argument("--no-docker", action="store_true", help="Skip Docker image extraction (Step3)")
     ap.add_argument("--pull-timeout", type=int, default=300, help="Timeout (seconds) for docker pull")
+    ap.add_argument("--helm-template-timeout", type=int, default=240, help="Timeout (seconds) for each helm template attempt")
+    ap.add_argument("--helm-dependency-timeout", type=int, default=90, help="Timeout (seconds) for helm dependency build")
+    ap.add_argument("--helm-skip-dependency-build", action="store_true", help="Skip helm dependency build to avoid network stalls")
+    ap.add_argument("--max-entry-extract", type=int, default=24, help="Max startup executables extracted per container to avoid slow script noise")
     ap.add_argument("--include-private-registry", action="store_true", help="Include private/custom registry images (default: skip to avoid long waits)")
+    ap.add_argument("--verbose", action="store_true", help="Print detailed [DEBUG]/[INFO]/[WARN] logs")
     args = ap.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
 
     must_have_tool("git")
     must_have_tool("helm")
@@ -1122,13 +1788,15 @@ def main() -> int:
 
     jsonl_path = outdir / "step1_4_report.jsonl"
     csv_summary_path = outdir / "step1_4_summary.csv"
+    csv_zero_diag_path = outdir / "step1_4_zero_diagnostics.csv"
     summary_rows: List[Dict[str, Any]] = []
+    zero_diag_rows: List[Dict[str, Any]] = []
 
     with jsonl_path.open("w", encoding="utf-8") as jf:
         for idx, (src, url) in enumerate(repos, start=1):
             repo_name = safe_repo_dir_name(url)
             repo_dir = workdir / repo_name
-            print(f"[{idx}/{len(repos)}] {url}")
+            print(f"[{idx}/{len(repos)}] repo={repo_name} url={url}")
             ok, action, detail = ensure_repo(url, repo_dir, skip_if_healthy=args.skip_existing)
             if not ok:
                 rr = RepoResult(
@@ -1144,6 +1812,7 @@ def main() -> int:
                     errors=[detail],
                 )
                 jf.write(json.dumps(asdict(rr), ensure_ascii=False) + "\n")
+                zero_diag_rows.extend(build_zero_diagnostic_rows(rr))
                 summary_rows.append({
                     "repo_url": url,
                     "repo_ok": False,
@@ -1155,6 +1824,7 @@ def main() -> int:
                     "entrypoints_matched": 0,
                     "errors": detail,
                 })
+                print("[SUMMARY] charts=0 containers=0 bins=0 matches=0")
                 continue
 
             repo_out = outdir / "repos" / repo_name
@@ -1168,11 +1838,16 @@ def main() -> int:
                 no_docker=args.no_docker,
                 skip_private_registry=not args.include_private_registry,
                 pull_timeout=args.pull_timeout,
+                helm_template_timeout=args.helm_template_timeout,
+                helm_dependency_timeout=args.helm_dependency_timeout,
+                helm_skip_dependency_build=args.helm_skip_dependency_build,
+                max_entry_extract=args.max_entry_extract,
             )
             rr.repo_ok = True
             rr.repo_action = action
             rr.repo_detail = detail
             jf.write(json.dumps(asdict(rr), ensure_ascii=False) + "\n")
+            zero_diag_rows.extend(build_zero_diagnostic_rows(rr))
 
             binaries_extracted = sum(len(c["extracted_binaries"]) for c in rr.containers)
             entrypoints_matched = sum(1 for c in rr.containers if c["matched_code_entrypoints"])
@@ -1187,7 +1862,14 @@ def main() -> int:
                 "entrypoints_matched": entrypoints_matched,
                 "errors": ";".join(rr.errors),
             })
-            print(f" [SUMMARY] charts={len(rr.charts_found)} containers={len(rr.containers)} bins={binaries_extracted} matches={entrypoints_matched}")
+            print(f"[SUMMARY] charts={len(rr.charts_found)} containers={len(rr.containers)} bins={binaries_extracted} matches={entrypoints_matched}")
+            for c in rr.containers:
+                for line in summarize_binary_language_records(c.get("binary_languages", []) or []):
+                    print(f"[BIN] {line}")
+                for line in summarize_repo_mismatch(c):
+                    print(f"[REPO] {line}")
+                for line in summarize_entry_matches(c):
+                    print(f"[MATCH] {line}")
 
     if summary_rows:
         with csv_summary_path.open("w", encoding="utf-8", newline="") as f:
@@ -1196,8 +1878,16 @@ def main() -> int:
             for r in summary_rows:
                 w.writerow(r)
 
+    if zero_diag_rows:
+        with csv_zero_diag_path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(zero_diag_rows[0].keys()))
+            w.writeheader()
+            for r in zero_diag_rows:
+                w.writerow(r)
+
     print(f"[*] Wrote JSONL: {jsonl_path}")
     print(f"[*] Wrote CSV : {csv_summary_path}")
+    print(f"[*] Wrote ZeroDiag CSV : {csv_zero_diag_path}")
     return 0
 
 
