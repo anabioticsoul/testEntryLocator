@@ -414,7 +414,25 @@ def find_repo_manifest_yaml_files(repo_dir: Path, max_files: int = 5000) -> List
 
 def obj_meta_name(obj: Dict[str, Any]) -> str:
     md = obj.get("metadata", {}) or {}
-    return md.get("name") or md.get("generateName") or ""
+    v = md.get("name") or md.get("generateName") or ""
+    if isinstance(v, str):
+        return v
+    return str(v) if v is not None else ""
+
+
+def safe_path_component(v: Any, default: str = "unknown") -> str:
+    if v is None:
+        s = ""
+    elif isinstance(v, str):
+        s = v
+    else:
+        s = str(v)
+    s = s.strip()
+    if not s:
+        s = default
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = s.strip("._-")
+    return (s or default)[:120]
 
 
 # ---------------------------
@@ -1512,8 +1530,19 @@ def analyze_repo(
     log_debug(f"candidate_mains={len(candidate_mains)} go_modules={len(go_modules)}")
 
     def process_container(c: Dict[str, Any], wname: str, wkind: str, section: str, source_tag: str) -> None:
+        wname_str = str(wname) if isinstance(wname, str) else str(wname or "")
+        wkind_str = str(wkind) if isinstance(wkind, str) else str(wkind or "")
+        section_str = str(section) if isinstance(section, str) else str(section or "")
         cname = c.get("name", "")
+        cname_str = str(cname) if isinstance(cname, str) else str(cname or "")
         image = c.get("image", "")
+        image_str = str(image) if isinstance(image, str) else str(image or "")
+
+        wkind_path = safe_path_component(wkind_str, "UnknownKind")
+        wname_path = safe_path_component(wname_str, "unknown_workload")
+        section_path = safe_path_component(section_str, "containers")
+        cname_path = safe_path_component(cname_str, "unnamed")
+
         startup = resolve_startup_chain(c, image, skip_image_config=True)
         extracted_bins: List[str] = []
         matched_entrypoints: List[str] = []
@@ -1525,40 +1554,40 @@ def analyze_repo(
         best_match_score = 0
         notes: List[str] = [f"source:{source_tag}"]
 
-        if image and not no_docker:
-            if skip_private_registry and is_private_registry_image(image):
+        if image_str and not no_docker:
+            if skip_private_registry and is_private_registry_image(image_str):
                 notes.append("private_registry_skipped")
-                log_info(f"skip private image: {image}")
+                log_info(f"skip private image: {image_str}")
                 if startup.final_cmdline:
                     notes.append("manifest_only_startup")
             else:
-                if docker_image_exists_locally(image):
-                    log_debug(f"image already exists locally, skip pull: {image}")
+                if docker_image_exists_locally(image_str):
+                    log_debug(f"image already exists locally, skip pull: {image_str}")
                     pull_ok, pull_msg = True, "already_present_local"
                 else:
-                    log_debug(f"pulling image: {image}")
-                    pull_ok, pull_msg = docker_pull(image, timeout=pull_timeout)
+                    log_debug(f"pulling image: {image_str}")
+                    pull_ok, pull_msg = docker_pull(image_str, timeout=pull_timeout)
 
                 if not pull_ok:
                     notes.append(f"docker_pull_failed:{pull_msg}")
-                    startup = resolve_startup_chain(c, image, skip_image_config=True)
+                    startup = resolve_startup_chain(c, image_str, skip_image_config=True)
                     if startup.final_cmdline:
                         notes.append("manifest_only_startup")
                 else:
-                    cid, cmsg = docker_create(image)
+                    cid, cmsg = docker_create(image_str)
                     if not cid:
                         notes.append(f"docker_create_failed:{cmsg}")
-                        startup = resolve_startup_chain(c, image, skip_image_config=True)
+                        startup = resolve_startup_chain(c, image_str, skip_image_config=True)
                         if startup.final_cmdline:
                             notes.append("manifest_only_due_to_create_fail")
                     else:
                         try:
-                            startup = resolve_startup_chain(c, image)
+                            startup = resolve_startup_chain(c, image_str)
                             startup = enrich_entries_with_scripts(
                                 cid,
-                                image,
+                                image_str,
                                 startup,
-                                out_dir / "scripts" / safe_repo_dir_name(repo_url) / wkind / wname / section / cname,
+                                out_dir / "scripts" / safe_repo_dir_name(repo_url) / wkind_path / wname_path / section_path / cname_path,
                             )
                             notes.extend(startup.notes)
                             extract_entries = select_entries_for_extraction(startup.entries, max_items=max_entry_extract)
@@ -1566,7 +1595,7 @@ def analyze_repo(
                                 notes.append(f"entry_extract_limited:{len(extract_entries)}/{len(startup.entries)}")
 
                             exe_map = docker_resolve_executables_batch(
-                                image,
+                                image_str,
                                 [e.exe for e in extract_entries],
                                 timeout=120,
                             )
@@ -1577,7 +1606,7 @@ def analyze_repo(
                                     notes.append(f"resolve_failed:{e.exe}")
                                     continue
                                 safe_bin_name = exe_path.lstrip('/').replace('/', '__') or Path(exe_path).name
-                                local_bin = out_dir / "binaries" / safe_repo_dir_name(repo_url) / wkind / wname / section / cname / safe_bin_name
+                                local_bin = out_dir / "binaries" / safe_repo_dir_name(repo_url) / wkind_path / wname_path / section_path / cname_path / safe_bin_name
                                 okcp, _ = docker_cp_from_container(cid, exe_path, local_bin)
                                 if not okcp:
                                     notes.append(f"copy_failed:{exe_path}")
@@ -1627,10 +1656,10 @@ def analyze_repo(
                 best_match_status = "no_candidate_mains"
 
         container_results.append(asdict(ContainerResult(
-            workload=wname,
-            kind=wkind,
-            container_name=f"{section}:{cname}",
-            image=image,
+            workload=wname_str,
+            kind=wkind_str,
+            container_name=f"{section_str}:{cname_str}",
+            image=image_str,
             manifest_cmdline=" ".join(manifest_cmdline_only(c)),
             final_cmdline=" ".join(startup.final_cmdline),
             scripts_considered=startup.scripts_considered,
@@ -1649,7 +1678,7 @@ def analyze_repo(
             notes=";".join(notes),
         )))
         log_debug(
-            f"{section}:{cname} | image={image} | final_cmd={len(startup.final_cmdline)} | "
+            f"{section_str}:{cname_str} | image={image_str} | final_cmd={len(startup.final_cmdline)} | "
             f"scripts={len(startup.scripts_considered)} | entries={len(startup.entries)} {format_entries_for_log(startup.entries)} | "
             f"bins={len(set(extracted_bins))} | matches={len(set(matched_entrypoints))} | status={best_match_status} | score={best_match_score}"
         )
