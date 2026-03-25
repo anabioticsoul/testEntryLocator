@@ -28,6 +28,7 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from collections import Counter
 
 try:
     import yaml
@@ -678,7 +679,7 @@ def enrich_entries_with_scripts(cid: str, image: str, startup: StartupResolution
 
 
 # ---------------------------
-# Step4: map binary -> code entrypoints (EPScan-like)
+# Step4: map binary -> code entrypoints (closer to EPScan)
 # ---------------------------
 MAIN_FUNC_RE = re.compile(r"^\s*func\s+main\s*\(\s*\)\s*{", re.MULTILINE)
 PKG_MAIN_RE = re.compile(r"^\s*package\s+main\s*$", re.MULTILINE)
@@ -700,24 +701,184 @@ def scan_repo_go_entrypoints(repo_dir: Path, max_files: int = 8000) -> List[Path
     return sorted(set(out), key=lambda x: str(x))
 
 
-def strings_match_source_paths(binary_path: Path, repo_dir: Path, candidate_main_files: List[Path]) -> List[str]:
-    if not candidate_main_files:
-        return []
-    rels = [str(p.relative_to(repo_dir)) for p in candidate_main_files if p.exists()]
-    if not rels:
-        return []
-    matched: List[str] = []
+def discover_go_modules(repo_dir: Path, max_files: int = 200) -> List[str]:
+    mods: List[str] = []
+    count = 0
+    for gm in repo_dir.rglob("go.mod"):
+        count += 1
+        if count > max_files:
+            break
+        try:
+            txt = gm.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        m = re.search(r"(?m)^\s*module\s+([^\s]+)\s*$", txt)
+        if m:
+            mods.append(m.group(1).strip())
+    return sorted(set(mods))
+
+
+def build_candidate_tokens(repo_dir: Path, candidate_main_files: List[Path], go_modules: List[str]) -> Dict[str, Set[str]]:
+    rels: Set[str] = set()
+    basenames: Set[str] = set()
+    packages: Set[str] = set()
+    dirs: Set[str] = set()
+    for p in candidate_main_files:
+        if not p.exists():
+            continue
+        try:
+            rel = str(p.relative_to(repo_dir)).replace('\\', '/')
+        except Exception:
+            rel = p.name
+        rels.add(rel)
+        basenames.add(p.name)
+        parent_rel = str(p.parent.relative_to(repo_dir)).replace('\\', '/') if p.parent != repo_dir else ''
+        if parent_rel:
+            dirs.add(parent_rel)
+            parts = [x for x in parent_rel.split('/') if x]
+            if parts:
+                packages.add('/'.join(parts))
+                if go_modules:
+                    for mod in go_modules:
+                        packages.add(f"{mod}/{parent_rel}")
+        if go_modules:
+            for mod in go_modules:
+                packages.add(f"{mod}/{rel}")
+                if parent_rel:
+                    packages.add(f"{mod}/{parent_rel}")
+    return {
+        'rels': rels,
+        'basenames': basenames,
+        'packages': packages,
+        'dirs': dirs,
+        'modules': set(go_modules),
+    }
+
+
+def get_binary_build_info(binary_path: Path) -> Dict[str, Any]:
+    info: Dict[str, Any] = {'is_go_binary': False, 'go_main': '', 'path': '', 'raw': ''}
+    if shutil.which('go') is None:
+        return info
     try:
-        code, out, _ = run(["strings", "-a", "-n", "6", str(binary_path)], timeout=120)
+        code, out, err = run(['go', 'version', '-m', str(binary_path)], timeout=120)
+    except Exception:
+        return info
+    txt = (out or '') + ('\n' + err if err else '')
+    info['raw'] = txt[:4000]
+    if code != 0 or not txt.strip():
+        return info
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    if lines:
+        info['is_go_binary'] = True
+    for ln in lines:
+        if ln.startswith('path\t'):
+            info['path'] = ln.split('\t', 1)[1].strip()
+        elif ln.startswith('mod\t'):
+            parts = ln.split('\t')
+            if len(parts) >= 2:
+                info['go_main'] = parts[1].strip()
+    return info
+
+
+def collect_binary_strings(binary_path: Path, max_lines: int = 50000) -> List[str]:
+    try:
+        code, out, _ = run(['strings', '-a', '-n', '6', str(binary_path)], timeout=120)
         if code != 0:
             return []
-        for line in out.splitlines():
-            for r in rels:
-                if r in line or Path(r).name in line:
-                    matched.append(r)
-        return sorted(set(matched))
+        lines = out.splitlines()
+        return lines[:max_lines]
     except Exception:
-        return sorted(set(matched))
+        return []
+
+
+@dataclass
+class MatchEvidence:
+    matched_entrypoints: List[str]
+    score: int
+    status: str
+    reasons: List[str]
+    build_info: Dict[str, Any]
+    sample_hits: List[str]
+
+
+def match_binary_to_entrypoints(binary_path: Path, repo_dir: Path, candidate_main_files: List[Path], go_modules: List[str]) -> MatchEvidence:
+    if not candidate_main_files:
+        return MatchEvidence([], 0, 'no_candidate_mains', ['repo_has_no_detected_main_go'], {}, [])
+
+    token_map = build_candidate_tokens(repo_dir, candidate_main_files, go_modules)
+    build_info = get_binary_build_info(binary_path)
+    lines = collect_binary_strings(binary_path)
+    if not lines and not build_info.get('is_go_binary'):
+        return MatchEvidence([], 0, 'no_binary_metadata', ['strings_failed_or_empty', 'go_version_m_failed_or_not_go'], build_info, [])
+
+    scores: Counter[str] = Counter()
+    reasons_by_rel: Dict[str, Set[str]] = {}
+    sample_hits: List[str] = []
+
+    rels = [str(p.relative_to(repo_dir)).replace('\\', '/') for p in candidate_main_files if p.exists()]
+
+    def add_reason(rel: str, pts: int, reason: str, sample: str = '') -> None:
+        scores[rel] += pts
+        reasons_by_rel.setdefault(rel, set()).add(reason)
+        if sample and len(sample_hits) < 12:
+            sample_hits.append(sample[:240])
+
+    build_path = (build_info.get('path') or '').strip()
+    build_mod = (build_info.get('go_main') or '').strip()
+    for rel in rels:
+        base = Path(rel).name
+        parent = str(Path(rel).parent).replace('\\', '/')
+        if build_path:
+            if base and build_path.endswith('/' + base):
+                add_reason(rel, 4, f'build_path_suffix:{build_path}', build_path)
+            if parent and parent != '.' and parent in build_path:
+                add_reason(rel, 5, f'build_path_parent:{parent}', build_path)
+        if build_mod:
+            if any(build_mod == m or build_mod.startswith(m + '/') for m in go_modules):
+                add_reason(rel, 3, f'build_mod_same_module:{build_mod}', build_mod)
+
+    for line in lines:
+        for rel in rels:
+            base = Path(rel).name
+            parent = str(Path(rel).parent).replace('\\', '/')
+            if rel and rel in line:
+                add_reason(rel, 8, f'rel_path:{rel}', line)
+            if parent and parent != '.' and f'/{parent}/' in line:
+                add_reason(rel, 4, f'parent_dir:{parent}', line)
+            if base and (('/' + base) in line or line.endswith(base)):
+                add_reason(rel, 1, f'basename:{base}', line)
+            for mod in go_modules:
+                pkg = f'{mod}/{parent}' if parent and parent != '.' else mod
+                if pkg and pkg in line:
+                    add_reason(rel, 5, f'module_pkg:{pkg}', line)
+                pkg_file = f'{mod}/{rel}'
+                if pkg_file in line:
+                    add_reason(rel, 6, f'module_file:{pkg_file}', line)
+
+    if not scores:
+        reasons = []
+        if build_info.get('is_go_binary'):
+            reasons.append('go_binary_detected_but_no_repo_path_or_module_evidence')
+            status = 'repo_mismatch_or_trimpath'
+        else:
+            reasons.append('binary_not_identified_as_go_or_metadata_missing')
+            status = 'non_go_or_stripped'
+        if go_modules:
+            reasons.append('repo_go_modules=' + ','.join(go_modules[:5]))
+        return MatchEvidence([], 0, status, reasons, build_info, sample_hits)
+
+    top_score = max(scores.values())
+    matched = sorted([rel for rel, sc in scores.items() if sc == top_score])
+    if top_score >= 8:
+        status = 'exact_or_strong_match'
+    elif top_score >= 4:
+        status = 'likely_match'
+    else:
+        status = 'weak_match'
+    reasons: List[str] = []
+    for rel in matched[:5]:
+        reasons.extend(sorted(reasons_by_rel.get(rel, set())))
+    return MatchEvidence(matched, top_score, status, reasons[:20], build_info, sample_hits)
 
 
 # ---------------------------
@@ -736,6 +897,13 @@ class ContainerResult:
     derived_entries: List[Dict[str, Any]]
     extracted_binaries: List[str]
     matched_code_entrypoints: List[str]
+    candidate_mains_count: int
+    repo_go_modules: List[str]
+    match_status: str
+    match_score: int
+    binary_build_info: List[Dict[str, Any]]
+    match_evidence: List[str]
+    sample_hits: List[str]
     notes: str
 
 
@@ -770,6 +938,8 @@ def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, 
     container_results: List[Dict[str, Any]] = []
     errors: List[str] = []
     candidate_mains = scan_repo_go_entrypoints(repo_dir)
+    go_modules = discover_go_modules(repo_dir)
+    print(f" [DEBUG] candidate_mains={len(candidate_mains)} go_modules={len(go_modules)}")
 
     for chart_dir in charts:
         chart_out = out_dir / "rendered" / chart_dir.relative_to(repo_dir)
@@ -800,6 +970,11 @@ def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, 
                     startup = StartupResolution([], [], [], [], ["docker_not_run"])
                     extracted_bins: List[str] = []
                     matched_entrypoints: List[str] = []
+                    binary_build_infos: List[Dict[str, Any]] = []
+                    match_evidence_lines: List[str] = []
+                    sample_hits: List[str] = []
+                    best_match_status = "not_attempted"
+                    best_match_score = 0
                     notes: List[str] = []
 
                     if image and not no_docker:
@@ -836,14 +1011,32 @@ def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, 
                                                 notes.append(f"copy_failed:{exe_path}")
                                                 continue
                                             extracted_bins.append(str(local_bin))
-                                            matches = strings_match_source_paths(local_bin, repo_dir, candidate_mains)
-                                            if matches:
-                                                matched_entrypoints.extend(matches)
+                                            mev = match_binary_to_entrypoints(local_bin, repo_dir, candidate_mains, go_modules)
+                                            binary_build_infos.append({
+                                                'binary': str(local_bin),
+                                                **mev.build_info,
+                                            })
+                                            if mev.matched_entrypoints:
+                                                matched_entrypoints.extend(mev.matched_entrypoints)
+                                            if mev.reasons:
+                                                match_evidence_lines.extend([f"{Path(local_bin).name}:{r}" for r in mev.reasons])
+                                            if mev.sample_hits:
+                                                sample_hits.extend([f"{Path(local_bin).name}:{s}" for s in mev.sample_hits])
+                                            if mev.score > best_match_score:
+                                                best_match_score = mev.score
+                                                best_match_status = mev.status
+                                            elif best_match_status == "not_attempted":
+                                                best_match_status = mev.status
                                     finally:
                                         docker_rm(cid)
                     elif no_docker:
                         notes.append("docker_skipped")
 
+                    if best_match_status == "not_attempted":
+                        if not extracted_bins:
+                            best_match_status = "no_extracted_binaries"
+                        elif candidate_mains == []:
+                            best_match_status = "no_candidate_mains"
                     container_results.append(asdict(ContainerResult(
                         workload=wname,
                         kind=wkind,
@@ -856,12 +1049,19 @@ def analyze_repo(repo_dir: Path, source_csv: str, repo_url: str, out_dir: Path, 
                         derived_entries=[asdict(e) for e in startup.entries],
                         extracted_binaries=sorted(set(extracted_bins)),
                         matched_code_entrypoints=sorted(set(matched_entrypoints)),
+                        candidate_mains_count=len(candidate_mains),
+                        repo_go_modules=go_modules[:20],
+                        match_status=best_match_status,
+                        match_score=best_match_score,
+                        binary_build_info=binary_build_infos,
+                        match_evidence=sorted(set(match_evidence_lines))[:50],
+                        sample_hits=sorted(set(sample_hits))[:20],
                         notes=";".join(notes),
                     )))
                     print(
                         f" [DEBUG] {section}:{cname} | image={image} | final_cmd={len(startup.final_cmdline)} | "
                         f"scripts={len(startup.scripts_considered)} | entries={len(startup.entries)} {format_entries_for_log(startup.entries)} | "
-                        f"bins={len(set(extracted_bins))} | matches={len(set(matched_entrypoints))}"
+                        f"bins={len(set(extracted_bins))} | matches={len(set(matched_entrypoints))} | status={best_match_status} | score={best_match_score}"
                     )
 
         if obj_count == 0:
